@@ -1,8 +1,8 @@
-FROM image-registry.openshift-image-registry.svc:5000/openshift/python:3.9-ubi9
+FROM registry.redhat.io/ubi9/python-39
 
 USER root
 # Copying in source code
-ADD app-src /tmp/src
+COPY upload/src /tmp/src
 # Change file ownership to the assemble user. Builder image must support chown command.
 RUN chown -R 1001:0 /tmp/src
 USER 1001
