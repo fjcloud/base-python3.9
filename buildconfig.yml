@@ -1,0 +1,44 @@
+kind: BuildConfig
+apiVersion: build.openshift.io/v1
+metadata:
+  name: dockerfile
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: 'python-api:dockerfile'
+  strategy:
+    type: Docker
+    dockerStrategy:
+      from:
+        kind: ImageStreamTag
+        namespace: openshift
+        name: 'python:3.9-ubi9'
+      dockerfilePath: Containerfile
+  source:
+    type: Git
+    git:
+      uri: 'https://github.com/fjcloud/base-python3.9'
+      
+---
+
+kind: BuildConfig
+apiVersion: build.openshift.io/v1
+metadata:
+  name: pure-s2i
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: 'python-api:s2i'
+  strategy:
+    type: Source
+    sourceStrategy:
+      from:
+        kind: ImageStreamTag
+        namespace: openshift
+        name: 'python:3.9-ubi9'
+  source:
+    type: Git
+    git:
+      uri: 'https://github.com/fjcloud/base-python3.9'
