@@ -2,7 +2,6 @@ kind: ImageStream
 apiVersion: image.openshift.io/v1
 metadata:
   name: python-api
-  namespace: ci-poc
 spec:
   lookupPolicy:
     local: false
