@@ -1,5 +1,4 @@
-FROM registry.access.redhat.com/ubi9/python-39
-
+FROM registry.access.redhat.com/ubi9/python-39:1-83
 USER root
 
 RUN pip install --no-cache-dir --upgrade pip && \
