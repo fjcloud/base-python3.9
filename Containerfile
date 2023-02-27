@@ -1,4 +1,4 @@
-FROM image-registry.openshift-image-registry.svc:5000/openshift/python:3.9-ubi9
+FROM registry.access.redhat.com/ubi9/python-39
 
 USER root
 
