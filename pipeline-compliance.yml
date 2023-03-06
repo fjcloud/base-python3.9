@@ -1,0 +1,590 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: base-python
+spec:
+  params:
+    - default: 'image-registry.openshift-image-registry.svc:5000/ci-poc/python-api'
+      description: The name of where to store the app image.
+      name: APP_IMAGE
+      type: string
+    - default: latest
+      description: The tag for the app image.
+      name: APP_IMAGE_TAG
+      type: string
+    - default: 'https://github.com/fjcloud/base-python3.9'
+      description: A git repo url where the source code resides.
+      name: SOURCE_URL
+      type: string
+  tasks:
+    - name: git-clone
+      params:
+        - name: url
+          value: $(params.SOURCE_URL)
+        - name: submodules
+          value: 'true'
+        - name: depth
+          value: '1'
+        - name: sslVerify
+          value: 'true'
+        - name: crtFileName
+          value: ca-bundle.crt
+        - name: deleteExisting
+          value: 'true'
+        - name: verbose
+          value: 'true'
+        - name: gitInitImage
+          value: >-
+            gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.40.2
+        - name: userHome
+          value: /home/git
+      taskRef:
+        kind: Task
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: workspace
+    - name: buildah
+      params:
+        - name: IMAGE
+          value: '$(params.APP_IMAGE):$(params.APP_IMAGE_TAG)'
+        - name: BUILDER_IMAGE
+          value: >-
+            registry.redhat.io/rhel8/buildah@sha256:ac0b8714cc260c94435cab46fe41b3de0ccbc3d93e38c395fa9d52ac49e521fe
+        - name: STORAGE_DRIVER
+          value: vfs
+        - name: DOCKERFILE
+          value: ./Containerfile
+        - name: CONTEXT
+          value: .
+        - name: TLSVERIFY
+          value: 'true'
+        - name: FORMAT
+          value: oci
+        - name: SKIP_PUSH
+          value: 'false'
+      runAfter:
+        - git-clone
+      taskRef:
+        kind: ClusterTask
+        name: buildah
+      workspaces:
+        - name: source
+          workspace: workspace
+    - name: rox-image-check
+      params:
+        - name: rox_central_endpoint
+          value: roxsecrets
+        - name: rox_api_token
+          value: roxsecrets
+        - name: IMAGE
+          value: $(params.APP_IMAGE)
+        - name: IMAGE_TAG
+          value: $(params.APP_IMAGE_TAG)
+      runAfter:
+        - cosign
+      taskRef:
+        kind: Task
+        name: rox-image-check
+      workspaces:
+        - name: source
+          workspace: workspace
+    - name: cosign
+      params:
+        - name: cosignkey
+          value: cosign
+        - name: IMAGE
+          value: $(params.APP_IMAGE)
+        - name: IMAGE_TAG
+          value: $(params.APP_IMAGE_TAG)
+        - name: NAMESPACE
+          value: mgen-ci-poc
+      runAfter:
+        - buildah
+      taskRef:
+        kind: Task
+        name: cosign
+      workspaces:
+        - name: source
+          workspace: workspace
+  workspaces:
+    - name: workspace
+---
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  annotations:
+    openshift.io/installed-from: tektonhub
+    tekton.dev/categories: Image Build
+    tekton.dev/pipelines.minVersion: 0.17.0
+    tekton.dev/platforms: 'linux/amd64,linux/s390x,linux/ppc64le,linux/arm64'
+    tekton.dev/tags: image-build
+  resourceVersion: '18181231'
+  name: buildah
+  labels:
+    app.kubernetes.io/version: '0.5'
+spec:
+  description: >-
+    Buildah task builds source into a container image and then pushes it to a
+    container registry.
+    Buildah Task builds source into a container image using Project Atomic's
+    Buildah build tool.It uses Buildah's support for building from Dockerfiles,
+    using its buildah bud command.This command executes the directives in the
+    Dockerfile to assemble a container image, then pushes that image to a
+    container registry.
+  params:
+    - description: Reference of the image buildah will produce.
+      name: IMAGE
+      type: string
+    - default: 'quay.io/buildah/stable:v1.23.3'
+      description: The location of the buildah builder image.
+      name: BUILDER_IMAGE
+      type: string
+    - default: overlay
+      description: Set buildah storage driver
+      name: STORAGE_DRIVER
+      type: string
+    - default: ./Dockerfile
+      description: Path to the Dockerfile to build.
+      name: DOCKERFILE
+      type: string
+    - default: .
+      description: Path to the directory to use as context.
+      name: CONTEXT
+      type: string
+    - default: 'true'
+      description: >-
+        Verify the TLS on the registry endpoint (for push/pull to a non-TLS
+        registry)
+      name: TLSVERIFY
+      type: string
+    - default: oci
+      description: 'The format of the built container, oci or docker'
+      name: FORMAT
+      type: string
+    - default: ''
+      description: Extra parameters passed for the build command when building images.
+      name: BUILD_EXTRA_ARGS
+      type: string
+    - default: ''
+      description: Extra parameters passed for the push command when pushing images.
+      name: PUSH_EXTRA_ARGS
+      type: string
+    - default: 'false'
+      description: Skip pushing the built image
+      name: SKIP_PUSH
+      type: string
+  results:
+    - description: Digest of the image just built.
+      name: IMAGE_DIGEST
+      type: string
+    - description: Image repository where the built image would be pushed to
+      name: IMAGE_URL
+      type: string
+  steps:
+    - image: $(params.BUILDER_IMAGE)
+      name: build
+      resources: {}
+      script: >
+        [[ "$(workspaces.sslcertdir.bound)" == "true" ]] &&
+        CERT_DIR_FLAG="--cert-dir $(workspaces.sslcertdir.path)"
+        [[ "$(workspaces.dockerconfig.bound)" == "true" ]] && export
+        DOCKER_CONFIG="$(workspaces.dockerconfig.path)"
+        buildah ${CERT_DIR_FLAG} --storage-driver=$(params.STORAGE_DRIVER) bud \
+          $(params.BUILD_EXTRA_ARGS) --format=$(params.FORMAT) \
+          --tls-verify=$(params.TLSVERIFY) --no-cache \
+          -f $(params.DOCKERFILE) -t $(params.IMAGE) $(params.CONTEXT)
+        [[ "$(params.SKIP_PUSH)" == "true" ]] && echo "Push skipped" && exit 0
+        buildah ${CERT_DIR_FLAG} --storage-driver=$(params.STORAGE_DRIVER) push
+        \
+          $(params.PUSH_EXTRA_ARGS) --tls-verify=$(params.TLSVERIFY) \
+          --digestfile /tmp/image-digest $(params.IMAGE) \
+          docker://$(params.IMAGE)
+        cat /tmp/image-digest | tee $(results.IMAGE_DIGEST.path)
+        echo -n "$(params.IMAGE)" | tee $(results.IMAGE_URL.path)
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+      workingDir: $(workspaces.source.path)
+  volumes:
+    - emptyDir: {}
+      name: varlibcontainers
+  workspaces:
+    - name: source
+    - name: sslcertdir
+      optional: true
+    - description: >-
+        An optional workspace that allows providing a .docker/config.json file
+        for Buildah to access the container registry. The file should be placed
+        at the root of the Workspace with name config.json.
+      name: dockerconfig
+      optional: true
+---
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  annotations:
+    openshift.io/installed-from: tektonhub
+    tekton.dev/categories: Git
+    tekton.dev/displayName: git clone
+    tekton.dev/pipelines.minVersion: 0.38.0
+    tekton.dev/platforms: 'linux/amd64,linux/s390x,linux/ppc64le,linux/arm64'
+    tekton.dev/tags: git
+  name: git-clone
+  labels:
+    app.kubernetes.io/version: '0.9'
+spec:
+  description: >-
+    These Tasks are Git tasks to work with repositories used by other tasks in
+    your Pipeline.
+    The git-clone Task will clone a repo from the provided url into the output
+    Workspace. By default the repo will be cloned into the root of your
+    Workspace. You can clone into a subdirectory by setting this Task's
+    subdirectory param. This Task also supports sparse checkouts. To perform a
+    sparse checkout, pass a list of comma separated directory patterns to this
+    Task's sparseCheckoutDirectories param.
+  params:
+    - description: Repository URL to clone from.
+      name: url
+      type: string
+    - default: ''
+      description: 'Revision to checkout. (branch, tag, sha, ref, etc...)'
+      name: revision
+      type: string
+    - default: ''
+      description: Refspec to fetch before checking out revision.
+      name: refspec
+      type: string
+    - default: 'true'
+      description: Initialize and fetch git submodules.
+      name: submodules
+      type: string
+    - default: '1'
+      description: 'Perform a shallow clone, fetching only the most recent N commits.'
+      name: depth
+      type: string
+    - default: 'true'
+      description: >-
+        Set the `http.sslVerify` global git config. Setting this to `false` is
+        not advised unless you are sure that you trust your git remote.
+      name: sslVerify
+      type: string
+    - default: ca-bundle.crt
+      description: >-
+        file name of mounted crt using ssl-ca-directory workspace. default value
+        is ca-bundle.crt.
+      name: crtFileName
+      type: string
+    - default: ''
+      description: Subdirectory inside the `output` Workspace to clone the repo into.
+      name: subdirectory
+      type: string
+    - default: ''
+      description: >-
+        Define the directory patterns to match or exclude when performing a
+        sparse checkout.
+      name: sparseCheckoutDirectories
+      type: string
+    - default: 'true'
+      description: >-
+        Clean out the contents of the destination directory if it already exists
+        before cloning.
+      name: deleteExisting
+      type: string
+    - default: ''
+      description: HTTP proxy server for non-SSL requests.
+      name: httpProxy
+      type: string
+    - default: ''
+      description: HTTPS proxy server for SSL requests.
+      name: httpsProxy
+      type: string
+    - default: ''
+      description: Opt out of proxying HTTP/HTTPS requests.
+      name: noProxy
+      type: string
+    - default: 'true'
+      description: Log the commands that are executed during `git-clone`'s operation.
+      name: verbose
+      type: string
+    - default: 'gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.40.2'
+      description: The image providing the git-init binary that this Task runs.
+      name: gitInitImage
+      type: string
+    - default: /home/git
+      description: |
+        Absolute path to the user's home directory.
+      name: userHome
+      type: string
+  results:
+    - description: The precise commit SHA that was fetched by this Task.
+      name: commit
+      type: string
+    - description: The precise URL that was fetched by this Task.
+      name: url
+      type: string
+    - description: The epoch timestamp of the commit that was fetched by this Task.
+      name: committer-date
+      type: string
+  steps:
+    - env:
+        - name: HOME
+          value: $(params.userHome)
+        - name: PARAM_URL
+          value: $(params.url)
+        - name: PARAM_REVISION
+          value: $(params.revision)
+        - name: PARAM_REFSPEC
+          value: $(params.refspec)
+        - name: PARAM_SUBMODULES
+          value: $(params.submodules)
+        - name: PARAM_DEPTH
+          value: $(params.depth)
+        - name: PARAM_SSL_VERIFY
+          value: $(params.sslVerify)
+        - name: PARAM_CRT_FILENAME
+          value: $(params.crtFileName)
+        - name: PARAM_SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: PARAM_DELETE_EXISTING
+          value: $(params.deleteExisting)
+        - name: PARAM_HTTP_PROXY
+          value: $(params.httpProxy)
+        - name: PARAM_HTTPS_PROXY
+          value: $(params.httpsProxy)
+        - name: PARAM_NO_PROXY
+          value: $(params.noProxy)
+        - name: PARAM_VERBOSE
+          value: $(params.verbose)
+        - name: PARAM_SPARSE_CHECKOUT_DIRECTORIES
+          value: $(params.sparseCheckoutDirectories)
+        - name: PARAM_USER_HOME
+          value: $(params.userHome)
+        - name: WORKSPACE_OUTPUT_PATH
+          value: $(workspaces.output.path)
+        - name: WORKSPACE_SSH_DIRECTORY_BOUND
+          value: $(workspaces.ssh-directory.bound)
+        - name: WORKSPACE_SSH_DIRECTORY_PATH
+          value: $(workspaces.ssh-directory.path)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
+          value: $(workspaces.basic-auth.bound)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
+          value: $(workspaces.basic-auth.path)
+        - name: WORKSPACE_SSL_CA_DIRECTORY_BOUND
+          value: $(workspaces.ssl-ca-directory.bound)
+        - name: WORKSPACE_SSL_CA_DIRECTORY_PATH
+          value: $(workspaces.ssl-ca-directory.path)
+      image: $(params.gitInitImage)
+      name: clone
+      resources: {}
+      script: >
+        #!/usr/bin/env sh
+        set -eu
+        if [ "${PARAM_VERBOSE}" = "true" ] ; then
+          set -x
+        fi
+        if [ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" = "true" ] ; then
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" "${PARAM_USER_HOME}/.git-credentials"
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.gitconfig" "${PARAM_USER_HOME}/.gitconfig"
+          chmod 400 "${PARAM_USER_HOME}/.git-credentials"
+          chmod 400 "${PARAM_USER_HOME}/.gitconfig"
+        fi
+        if [ "${WORKSPACE_SSH_DIRECTORY_BOUND}" = "true" ] ; then
+          cp -R "${WORKSPACE_SSH_DIRECTORY_PATH}" "${PARAM_USER_HOME}"/.ssh
+          chmod 700 "${PARAM_USER_HOME}"/.ssh
+          chmod -R 400 "${PARAM_USER_HOME}"/.ssh/*
+        fi
+        if [ "${WORKSPACE_SSL_CA_DIRECTORY_BOUND}" = "true" ] ; then
+           export GIT_SSL_CAPATH="${WORKSPACE_SSL_CA_DIRECTORY_PATH}"
+           if [ "${PARAM_CRT_FILENAME}" != "" ] ; then
+              export GIT_SSL_CAINFO="${WORKSPACE_SSL_CA_DIRECTORY_PATH}/${PARAM_CRT_FILENAME}"
+           fi
+        fi
+        CHECKOUT_DIR="${WORKSPACE_OUTPUT_PATH}/${PARAM_SUBDIRECTORY}"
+        cleandir() {
+          # Delete any existing contents of the repo directory if it exists.
+          #
+          # We don't just "rm -rf ${CHECKOUT_DIR}" because ${CHECKOUT_DIR} might be "/"
+          # or the root of a mounted volume.
+          if [ -d "${CHECKOUT_DIR}" ] ; then
+            # Delete non-hidden files and directories
+            rm -rf "${CHECKOUT_DIR:?}"/*
+            # Delete files and directories starting with . but excluding ..
+            rm -rf "${CHECKOUT_DIR}"/.[!.]*
+            # Delete files and directories starting with .. plus any other character
+            rm -rf "${CHECKOUT_DIR}"/..?*
+          fi
+        }
+        if [ "${PARAM_DELETE_EXISTING}" = "true" ] ; then
+          cleandir || true
+        fi
+        test -z "${PARAM_HTTP_PROXY}" || export HTTP_PROXY="${PARAM_HTTP_PROXY}"
+        test -z "${PARAM_HTTPS_PROXY}" || export
+        HTTPS_PROXY="${PARAM_HTTPS_PROXY}"
+        test -z "${PARAM_NO_PROXY}" || export NO_PROXY="${PARAM_NO_PROXY}"
+        git config --global --add safe.directory "${WORKSPACE_OUTPUT_PATH}"
+        /ko-app/git-init \
+          -url="${PARAM_URL}" \
+          -revision="${PARAM_REVISION}" \
+          -refspec="${PARAM_REFSPEC}" \
+          -path="${CHECKOUT_DIR}" \
+          -sslVerify="${PARAM_SSL_VERIFY}" \
+          -submodules="${PARAM_SUBMODULES}" \
+          -depth="${PARAM_DEPTH}" \
+          -sparseCheckoutDirectories="${PARAM_SPARSE_CHECKOUT_DIRECTORIES}"
+        cd "${CHECKOUT_DIR}"
+        RESULT_SHA="$(git rev-parse HEAD)"
+        EXIT_CODE="$?"
+        if [ "${EXIT_CODE}" != 0 ] ; then
+          exit "${EXIT_CODE}"
+        fi
+        RESULT_COMMITTER_DATE="$(git log -1 --pretty=%ct)"
+        printf "%s" "${RESULT_COMMITTER_DATE}" >
+        "$(results.committer-date.path)"
+        printf "%s" "${RESULT_SHA}" > "$(results.commit.path)"
+        printf "%s" "${PARAM_URL}" > "$(results.url.path)"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+  workspaces:
+    - description: The git repo will be cloned onto the volume backing this Workspace.
+      name: output
+    - description: |
+        A .ssh directory with private key, known_hosts, config, etc. Copied to
+        the user's home before git commands are executed. Used to authenticate
+        with the git remote when performing the clone. Binding a Secret to this
+        Workspace is strongly recommended over other volume types.
+      name: ssh-directory
+      optional: true
+    - description: |
+        A Workspace containing a .gitconfig and .git-credentials file. These
+        will be copied to the user's home before any git commands are run. Any
+        other files in this Workspace are ignored. It is strongly recommended
+        to use ssh-directory over basic-auth whenever possible and to bind a
+        Secret to this Workspace over other volume types.
+      name: basic-auth
+      optional: true
+    - description: |
+        A workspace containing CA certificates, this will be used by Git to
+        verify the peer with when fetching or pushing over HTTPS.
+      name: ssl-ca-directory
+      optional: true
+
+---
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  annotations:
+    tekton.dev/pipelines.minVersion: 0.12.1
+  name: cosign
+  labels:
+    app.kubernetes.io/version: 0.1.0
+spec:
+  description: >-
+    These tasks make it possible to use cosign within your Tekton pipelines
+    cosign is a tool for signing and verifying software artifacts.
+  params:
+    - name: cosignkey
+      type: string
+    - name: IMAGE
+      type: string
+    - name: IMAGE_TAG
+      type: string
+    - name: NAMESPACE
+      type: string
+  results:
+    - description: The email from the certificate common name in JSON format
+      name: email
+      type: string
+  steps:
+    - env:
+        - name: COSIGN_EXPERIMENTAL
+          value: '1'
+      image: 'gcr.io/projectsigstore/cosign:v1.13.1'
+      name: cosign
+      resources: {}
+      script: >
+        #!/busybox/env /busybox/sh
+
+        CMD="cosign sign --key k8s://$(params.NAMESPACE)/$(params.cosignkey)
+        $(params.IMAGE):$(params.IMAGE_TAG)"
+
+        echo "${CMD}"
+
+        ERR_MSG="Failed to sign $(params.IMAGE):$(params.IMAGE_TAG)"
+
+        ${CMD} &> result
+
+        err=$?
+
+        cat result
+
+        if [[ ${err} -ne 0 ]]; then
+          echo "${ERR_MSG}"
+          exit 1
+        fi
+      workingDir: $(workspaces.source.path)
+  workspaces:
+    - name: source
+
+---
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+  name: rox-image-check
+spec:
+  params:
+    - description: >-
+        Secret containing the address:port tuple for StackRox Central (example -
+        rox.stackrox.io:443)
+      name: rox_central_endpoint
+      type: string
+    - description: Secret containing the StackRox API token with CI permissions
+      name: rox_api_token
+      type: string
+    - description: Full name of image to scan
+      name: IMAGE
+      type: string
+    - description: Tag of image to scan
+      name: IMAGE_TAG
+      type: string
+  results:
+    - description: Output of `roxctl image check`
+      name: check_output
+      type: string
+  steps:
+    - env:
+        - name: ROX_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: rox_api_token
+              name: $(params.rox_api_token)
+        - name: ROX_CENTRAL_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              key: rox_central_endpoint
+              name: $(params.rox_central_endpoint)
+      image: 'registry.access.redhat.com/ubi8/ubi-minimal:latest'
+      name: rox-image-check
+      resources: {}
+      script: >-
+        #!/usr/bin/env bash
+
+        ROX_API_TOKEN=$(echo $ROX_API_TOKEN | sed -e 's/\\n//g')
+
+        curl -k -L -H "Authorization: Bearer $ROX_API_TOKEN"
+        https://$ROX_CENTRAL_ENDPOINT/api/cli/download/roxctl-linux --output
+        ./roxctl  > /dev/null; echo "Getting roxctl"
+
+        chmod +x ./roxctl > /dev/null
+
+        ./roxctl image check --insecure-skip-tls-verify -e $ROX_CENTRAL_ENDPOINT
+        --image $(params.IMAGE):$(params.IMAGE_TAG)
+      workingDir: $(workspaces.source.path)
+  workspaces:
+    - name: source
